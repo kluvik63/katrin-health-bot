@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-CLAUDE_KEY = os.environ.get("CLAUDE_API_KEY", "")
+CLAUDE_KEY = os.environ.get("CLAUDE_API_TOKEN", "")
 ALLOWED_USERS = []
 
 bot    = Bot(token=BOT_TOKEN)
