@@ -1,5 +1,12 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import logging
+import sys
+import io
+
+# Принудительно UTF-8 для всего вывода
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
@@ -192,6 +199,23 @@ async def cmd_myid(message: Message):
     await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
 
 
+async def ask_claude(uid: int, messages_list: list) -> str:
+    """Универсальный вызов Claude с правильной кодировкой"""
+    response = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2000,
+        system=SYSTEM_PROMPT,
+        messages=messages_list
+    )
+    return response.content[0].text
+
+
+async def send_long(message: Message, text: str):
+    """Отправка длинного текста частями"""
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i+4000])
+
+
 @dp.message(lambda m: m.photo or m.document)
 async def handle_photo(message: Message):
     """Обработка фото анализов"""
@@ -203,55 +227,56 @@ async def handle_photo(message: Message):
 
     await bot.send_chat_action(message.chat.id, "typing")
 
-    caption = message.caption or ""
-    user_text = f"[Пользователь прислал фото/документ]\n{caption}\nОпиши что ты видишь на изображении и проанализируй если это анализы."
+    try:
+        if message.photo:
+            import base64 as b64
+            photo = message.photo[-1]
+            file = await bot.get_file(photo.file_id)
+            downloaded = await bot.download_file(file.file_path)
+            raw_bytes = downloaded.read()
+            image_data = b64.b64encode(raw_bytes).decode("ascii")
+            caption = message.caption or "Это анализы крови. Расшифруй все показатели, выяви отклонения и составь протокол коррекции."
 
-    if message.photo:
-        # Скачиваем фото для передачи в Claude
-        photo = message.photo[-1]
-        file = await bot.get_file(photo.file_id)
-        file_bytes = await bot.download_file(file.file_path)
-        import base64
-        image_data = base64.b64encode(file_bytes.read()).decode()
-
-        conversations[uid].append({
-            "role": "user",
-            "content": [
+            # Фото НЕ сохраняем в историю (слишком большое), отправляем разово
+            one_shot = [
                 {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_data
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": caption if caption else "Это анализы крови. Пожалуйста, расшифруй все показатели, выяви отклонения и составь протокол коррекции."
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_data
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": caption
+                        }
+                    ]
                 }
             ]
-        })
-    else:
-        conversations[uid].append({"role": "user", "content": user_text})
+            reply = await ask_claude(uid, one_shot)
+            # Сохраняем только текстовую версию в историю
+            conversations[uid].append({"role": "user", "content": f"[Фото анализов] {caption}"})
+            conversations[uid].append({"role": "assistant", "content": reply})
+        else:
+            caption = message.caption or "Файл без описания"
+            conversations[uid].append({"role": "user", "content": f"[Документ] {caption}"})
+            if len(conversations[uid]) > 20:
+                conversations[uid] = conversations[uid][-20:]
+            reply = await ask_claude(uid, conversations[uid])
+            conversations[uid].append({"role": "assistant", "content": reply})
 
-    if len(conversations[uid]) > 20:
-        conversations[uid] = conversations[uid][-20:]
+        if len(conversations[uid]) > 20:
+            conversations[uid] = conversations[uid][-20:]
 
-    try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=conversations[uid]
-        )
-        reply = response.content[0].text
-        conversations[uid].append({"role": "assistant", "content": reply})
-        # Разбиваем длинный ответ на части (лимит Telegram 4096 символов)
-        for i in range(0, len(reply), 4000):
-            await message.answer(reply[i:i+4000])
+        await send_long(message, reply)
+
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await message.answer("⚠️ Ошибка при обращении к ИИ. Попробуй ещё раз.")
+        logging.error("Ошибка фото: %s", str(e))
+        await message.answer("⚠️ Не удалось обработать фото. Попробуй ещё раз или пришли анализы текстом.")
 
 
 @dp.message()
@@ -264,7 +289,8 @@ async def handle_message(message: Message):
     if uid not in conversations:
         conversations[uid] = []
 
-    conversations[uid].append({"role": "user", "content": message.text})
+    user_text = message.text or ""
+    conversations[uid].append({"role": "user", "content": user_text})
 
     if len(conversations[uid]) > 20:
         conversations[uid] = conversations[uid][-20:]
@@ -272,18 +298,11 @@ async def handle_message(message: Message):
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=conversations[uid]
-        )
-        reply = response.content[0].text
+        reply = await ask_claude(uid, conversations[uid])
         conversations[uid].append({"role": "assistant", "content": reply})
-        for i in range(0, len(reply), 4000):
-            await message.answer(reply[i:i+4000])
+        await send_long(message, reply)
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logging.error("Ошибка текст: %s", str(e))
         await message.answer("⚠️ Ошибка при обращении к ИИ. Попробуй ещё раз.")
 
 
